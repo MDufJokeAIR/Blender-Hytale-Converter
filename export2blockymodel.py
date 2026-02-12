@@ -175,7 +175,7 @@ def sample_face_points(vertices, faces):
 # Core subdivision algorithm
 # ============================================================================
 
-def subdivide_mesh_into_blocks(obj, max_blocks, adjust_orientation, plane_threshold):
+def subdivide_mesh_into_blocks(obj, max_blocks, adjust_orientation, plane_threshold, merge_threshold=0.95):
     """
     1. Compute AABB of the mesh.
     2. Compute proportional grid (nx x ny x nz) so total <= max_blocks,
@@ -279,6 +279,7 @@ def subdivide_mesh_into_blocks(obj, max_blocks, adjust_orientation, plane_thresh
 
     print(f"  Kept {len(blocks)} non-empty blocks")
     blocks = merge_planar_blocks(blocks)
+    blocks = merge_adjacent_and_contained_blocks(blocks, merge_threshold)
     return blocks
 
 
@@ -405,10 +406,16 @@ def merge_planar_blocks(blocks, gap_tolerance=0.1):
 # PCA orientation fitting
 # ============================================================================
 
-def pca_oriented_box(cell_verts, size_aabb, plane_threshold):
+def pca_oriented_box(cell_verts, size_aabb, plane_threshold, min_rotation_deg=5.0):
     """
     Run PCA on cell_verts to find a rotation that minimises the bounding box volume.
     Returns (quaternion, size).  Falls back to identity if PCA gives no gain.
+    
+    Args:
+        cell_verts: list of Vector points
+        size_aabb: Vector of AABB size
+        plane_threshold: threshold for flattening dimensions to 0
+        min_rotation_deg: minimum rotation angle in degrees required to apply PCA (default 5.0)
     """
     if len(cell_verts) < 3:
         return Quaternion((1, 0, 0, 0)), size_aabb
@@ -441,7 +448,7 @@ def pca_oriented_box(cell_verts, size_aabb, plane_threshold):
     if obb_size.y < plane_threshold: obb_size.y = 0.0
     if obb_size.z < plane_threshold: obb_size.z = 0.0
 
-    # Only use if meaningfully smaller
+    # Only use if meaningfully smaller AND rotation is significant enough
     vol_aabb = size_aabb.x * size_aabb.y * size_aabb.z
     vol_obb  = obb_size.x  * obb_size.y  * obb_size.z
 
@@ -449,7 +456,16 @@ def pca_oriented_box(cell_verts, size_aabb, plane_threshold):
         rot_mat = Matrix.Identity(3)
         for i in range(3):
             rot_mat.col[i] = Vector(eigenvectors[:, i])
-        return rot_mat.to_quaternion(), obb_size
+        pca_quat = rot_mat.to_quaternion()
+        
+        # Calculate rotation angle from identity
+        # Angle = 2 * acos(|w|) where w is the w component
+        angle_rad = 2.0 * math.acos(min(1.0, abs(pca_quat.w)))
+        angle_deg = math.degrees(angle_rad)
+        
+        # Only apply if rotation is significant enough
+        if angle_deg >= min_rotation_deg:
+            return pca_quat, obb_size
 
     return Quaternion((1, 0, 0, 0)), size_aabb
 
@@ -483,7 +499,305 @@ def blender_quat_to_hytale(quat):
 # Per-mesh export wrapper
 # ============================================================================
 
-def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold):
+def apply_mirroring(blocks, mirror_axis, merge_threshold=0.95):
+    """
+    Mirror blocks across the specified axis.
+    Splits generation area in half on the given axis, then mirrors blocks.
+    
+    Args:
+        blocks: list of (center, size, quaternion) tuples
+        mirror_axis: 'X', 'Y', or 'Z' - which axis to mirror along
+        merge_threshold: minimum volume overlap ratio to merge (default 0.95)
+    
+    Returns:
+        Extended list with both original and mirrored blocks
+    """
+    if not blocks:
+        return blocks
+    
+    # Map axis names to indices
+    axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[mirror_axis]
+    
+    mirrored_blocks = []
+    
+    for center, size, quat in blocks:
+        # Keep original block
+        mirrored_blocks.append((center, size, quat))
+        
+        # Create mirrored block
+        mirror_center = Vector(center)
+        mirror_center[axis_idx] = -mirror_center[axis_idx]
+        
+        # Mirror the quaternion rotation across the axis
+        # For a rotation matrix, mirroring means flipping the signs of rotations around the other axes
+        quat_arr = [quat.w, quat.x, quat.y, quat.z]
+        mirror_quat = Quaternion(quat_arr)
+        
+        # Flip the appropriate rotation components for the mirrored side
+        # We need to adjust the quaternion for the mirror
+        rot_matrix = quat.to_matrix()
+        mirror_mat = Matrix.Identity(3)
+        mirror_mat[axis_idx][axis_idx] = -1
+        
+        # Apply mirror: R_mirror = M @ R @ M (where M is the mirror matrix)
+        mirrored_rot_matrix = mirror_mat @ rot_matrix @ mirror_mat
+        mirror_quat = mirrored_rot_matrix.to_quaternion()
+        
+        mirrored_blocks.append((mirror_center, size, mirror_quat))
+    
+    print(f"  Mirrored along {mirror_axis}: {len(mirrored_blocks)} blocks before merge")
+    
+    # Merge blocks with complete face contacts and contained volumes
+    merged = merge_adjacent_and_contained_blocks(mirrored_blocks, merge_threshold)
+    return merged
+
+
+def merge_adjacent_and_contained_blocks(blocks, volume_overlap_threshold=0.95):
+    """
+    Merge blocks in three ways:
+    1. Blocks with complete face-to-face contact on any axis (same orientation required)
+    2. Blocks whose volume is completely contained within another block
+    3. Blocks that have significant volume overlap (>= threshold, default 95%)
+    
+    Args:
+        blocks: list of (center, size, quaternion) tuples
+        volume_overlap_threshold: minimum volume overlap ratio to merge (default 0.95)
+    
+    Returns:
+        Deduplicated list with merged blocks
+    """
+    if not blocks:
+        return blocks
+    
+    merged_blocks = []
+    processed = set()
+    
+    def quaternions_equal(q1, q2, tol=0.1):
+        """Check if two quaternions represent the same rotation (within tolerance)."""
+        dot = abs(q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w)
+        return dot > (1.0 - tol)
+    
+    def get_extents(center, size):
+        """Get min and max for each axis."""
+        return (
+            (center.x - size.x / 2, center.x + size.x / 2),
+            (center.y - size.y / 2, center.y + size.y / 2),
+            (center.z - size.z / 2, center.z + size.z / 2),
+        )
+    
+    def is_contained(ext_a, ext_b, tol=0.1):
+        """Check if extent A is completely contained within extent B."""
+        return all(ext_a[i][0] >= ext_b[i][0] - tol and 
+                   ext_a[i][1] <= ext_b[i][1] + tol 
+                   for i in range(3))
+    
+    def calculate_overlap_volume(ext_a, ext_b):
+        """Calculate the volume of intersection between two extents."""
+        overlap = 1.0
+        for i in range(3):
+            overlap_min = max(ext_a[i][0], ext_b[i][0])
+            overlap_max = min(ext_a[i][1], ext_b[i][1])
+            overlap_size = max(0.0, overlap_max - overlap_min)
+            overlap *= overlap_size
+        return overlap
+    
+    def has_significant_overlap(ext_a, ext_b, size_a, size_b, threshold):
+        """Check if blocks have significant volume overlap."""
+        vol_a = size_a.x * size_a.y * size_a.z
+        vol_b = size_b.x * size_b.y * size_b.z
+        
+        if vol_a < 1e-6 or vol_b < 1e-6:
+            return False
+        
+        overlap_vol = calculate_overlap_volume(ext_a, ext_b)
+        
+        # Check if overlap is >= threshold of either block's volume
+        overlap_ratio_a = overlap_vol / vol_a
+        overlap_ratio_b = overlap_vol / vol_b
+        
+        return overlap_ratio_a >= threshold or overlap_ratio_b >= threshold
+    
+    def faces_fully_touching(ext_a, ext_b, axis, tol=0.01):
+        """Check if blocks touch completely on a given axis."""
+        other_axes = [i for i in range(3) if i != axis]
+        
+        # Check if they touch on the given axis
+        max_a = ext_a[axis][1]
+        min_b = ext_b[axis][0]
+        max_b = ext_b[axis][1]
+        min_a = ext_a[axis][0]
+        
+        touching = False
+        face_a = None  # Will be 'max' or 'min'
+        face_b = None
+        
+        # Case 1: max of A touches min of B
+        if abs(max_a - min_b) < 1e-6:
+            touching = True
+            face_a = 'max'
+            face_b = 'min'
+        # Case 2: max of B touches min of A
+        elif abs(max_b - min_a) < 1e-6:
+            touching = True
+            face_a = 'min'
+            face_b = 'max'
+        
+        if not touching:
+            return False
+        
+        # Check if the faces fully overlap on the other two axes
+        for oa in other_axes:
+            # One block's extent must fully contain the other on this axis
+            # OR they must match exactly
+            a_min, a_max = ext_a[oa]
+            b_min, b_max = ext_b[oa]
+            
+            a_size = a_max - a_min
+            b_size = b_max - b_min
+            
+            # Check if either fully covers the other
+            a_covers_b = (a_min <= b_min + tol and a_max >= b_max - tol)
+            b_covers_a = (b_min <= a_min + tol and b_max >= a_max - tol)
+            
+            if not (a_covers_b or b_covers_a):
+                return False
+        
+        return True
+    
+    for i, (center_a, size_a, quat_a) in enumerate(blocks):
+        if i in processed:
+            continue
+        
+        matched = False
+        ext_a = get_extents(center_a, size_a)
+        vol_a = size_a.x * size_a.y * size_a.z
+        
+        # Try to find another block to merge with
+        for j in range(i + 1, len(blocks)):
+            if j in processed:
+                continue
+            
+            center_b, size_b, quat_b = blocks[j]
+            ext_b = get_extents(center_b, size_b)
+            vol_b = size_b.x * size_b.y * size_b.z
+            
+            # Check 1: Volume containment (A inside B or B inside A)
+            if is_contained(ext_a, ext_b, tol=0.1):
+                # A is inside B, keep B
+                processed.add(i)
+                matched = True
+                break
+            elif is_contained(ext_b, ext_a, tol=0.1):
+                # B is inside A, keep A (skip B later)
+                processed.add(j)
+                continue
+            
+            # Check 2: Significant volume overlap (orientation-independent)
+            if has_significant_overlap(ext_a, ext_b, size_a, size_b, volume_overlap_threshold):
+                # Merge with mean position and mean rotation
+                new_center = (center_a + center_b) * 0.5
+                
+                # Average the quaternions using SLERP (ensure shortest path)
+                # If dot product is negative, they're on opposite sides - negate one
+                dot = quat_a.x * quat_b.x + quat_a.y * quat_b.y + quat_a.z * quat_b.z + quat_a.w * quat_b.w
+                if dot < 0:
+                    quat_b_adj = Quaternion((-quat_b.w, -quat_b.x, -quat_b.y, -quat_b.z))
+                else:
+                    quat_b_adj = quat_b
+                new_quat = quat_a.slerp(quat_b_adj, 0.5)
+                
+                # Compute merged size: transform both blocks into mean rotation frame
+                # to find the AABB that covers both in the merged quaternion's space
+                inv_rot = new_quat.inverted().to_matrix()
+                
+                # Get all 8 corners of both blocks in original frame, transform to mean frame
+                def get_corners(center, size):
+                    return [
+                        Vector((center.x + dx * size.x / 2, center.y + dy * size.y / 2, center.z + dz * size.z / 2))
+                        for dx in (-1, 1) for dy in (-1, 1) for dz in (-1, 1)
+                    ]
+                
+                corners_a = [inv_rot @ (c - new_center) for c in get_corners(center_a, size_a)]
+                corners_b = [inv_rot @ (c - new_center) for c in get_corners(center_b, size_b)]
+                
+                all_corners = corners_a + corners_b
+                
+                # AABB in mean frame
+                if all_corners:
+                    min_corner = Vector((
+                        min(c.x for c in all_corners),
+                        min(c.y for c in all_corners),
+                        min(c.z for c in all_corners),
+                    ))
+                    max_corner = Vector((
+                        max(c.x for c in all_corners),
+                        max(c.y for c in all_corners),
+                        max(c.z for c in all_corners),
+                    ))
+                    # Get theoretical AABB proportions
+                    theoretical_aabb = max_corner - min_corner
+                    vol_theoretical = theoretical_aabb.x * theoretical_aabb.y * theoretical_aabb.z
+                    
+                    # Calculate combined volume
+                    vol_a = size_a.x * size_a.y * size_a.z
+                    vol_b = size_b.x * size_b.y * size_b.z
+                    combined_volume = vol_a + vol_b
+                    
+                    # Scale theoretical AABB to match combined volume while preserving proportions
+                    if vol_theoretical > 1e-6:
+                        scale_factor = (combined_volume / vol_theoretical) ** (1.0 / 3.0)
+                        new_size = theoretical_aabb * scale_factor
+                    else:
+                        new_size = theoretical_aabb
+                else:
+                    new_size = size_a
+                
+                merged_blocks.append((new_center, new_size, new_quat))
+                processed.add(i)
+                processed.add(j)
+                matched = True
+                break
+            
+            # Check 3: Complete face touching (requires same orientation)
+            if not quaternions_equal(quat_a, quat_b):
+                continue
+            
+            # Check if they have complete face contact on any axis
+            merged = False
+            for axis in range(3):
+                if faces_fully_touching(ext_a, ext_b, axis):
+                    # Merge them
+                    new_center = Vector(center_a)
+                    new_size = Vector(size_a)
+                    
+                    # Expand to cover both blocks
+                    for k in range(3):
+                        new_min = min(ext_a[k][0], ext_b[k][0])
+                        new_max = max(ext_a[k][1], ext_b[k][1])
+                        new_center[k] = (new_min + new_max) / 2
+                        new_size[k] = new_max - new_min
+                    
+                    merged_blocks.append((new_center, new_size, quat_a))
+                    processed.add(i)
+                    processed.add(j)
+                    matched = True
+                    merged = True
+                    break
+            
+            if merged:
+                break
+        
+        if not matched:
+            merged_blocks.append((center_a, size_a, quat_a))
+            processed.add(i)
+    
+    if len(merged_blocks) < len(blocks):
+        print(f"  Merged adjacent/contained blocks: {len(blocks)} -> {len(merged_blocks)}")
+    
+    return merged_blocks
+
+
+def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, enable_mirror=False, mirror_axis='X', merge_threshold=0.95):
     """Build group node + child box nodes for one mesh object."""
     world_pos = obj.matrix_world.translation
 
@@ -492,8 +806,12 @@ def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold):
     group = make_group_node(node_id, obj.name, hytale_pos)
 
     blocks = subdivide_mesh_into_blocks(
-        obj, max_blocks, adjust_orientation, plane_threshold
+        obj, max_blocks, adjust_orientation, plane_threshold, merge_threshold
     )
+
+    # Apply mirroring if enabled
+    if enable_mirror:
+        blocks = apply_mirroring(blocks, mirror_axis, merge_threshold)
 
     for i, (center, size, quat) in enumerate(blocks):
         # Relative position
@@ -536,7 +854,7 @@ class ExportBlockyModel(Operator, ExportHelper):
         description="Maximum number of blocks generated per mesh object",
         default=8,
         min=1,
-        max=256,
+        max=1024,
     )
 
     plane_threshold: FloatProperty(
@@ -563,6 +881,32 @@ class ExportBlockyModel(Operator, ExportHelper):
         default=False,
     )
 
+    enable_mirror: BoolProperty(
+        name="Enable Mirroring",
+        description="Split mesh in half and mirror blocks to double coverage",
+        default=False,
+    )
+
+    mirror_axis: bpy.props.EnumProperty(
+        name="Mirror Axis",
+        description="Axis to split and mirror along",
+        items=[
+            ('X', "X Axis", "Mirror along X axis"),
+            ('Y', "Y Axis", "Mirror along Y axis"),
+            ('Z', "Z Axis", "Mirror along Z axis"),
+        ],
+        default='X',
+    )
+
+    merge_threshold: FloatProperty(
+        name="Merge Threshold",
+        description="Minimum volume overlap ratio to merge blocks (0.0-1.0)",
+        default=0.95,
+        min=0.0,
+        max=1.0,
+        precision=2,
+    )
+
     def execute(self, context):
         t0 = time.time()
 
@@ -581,6 +925,9 @@ class ExportBlockyModel(Operator, ExportHelper):
         print(f"  Max blocks    : {self.max_blocks}")
         print(f"  Plane thresh  : {self.plane_threshold}")
         print(f"  Adjust orient : {self.adjust_orientation}")
+        print(f"  Merge thresh  : {self.merge_threshold * 100:.0f}%")
+        if self.enable_mirror:
+            print(f"  Mirror axis   : {self.mirror_axis}")
         print("=" * 60)
 
         top_nodes = []
@@ -592,6 +939,9 @@ class ExportBlockyModel(Operator, ExportHelper):
                 max_blocks=self.max_blocks,
                 adjust_orientation=self.adjust_orientation,
                 plane_threshold=self.plane_threshold,
+                enable_mirror=self.enable_mirror,
+                mirror_axis=self.mirror_axis,
+                merge_threshold=self.merge_threshold,
             )
             top_nodes.append(group)
 
@@ -627,11 +977,28 @@ class ExportBlockyModel(Operator, ExportHelper):
             box2.label(text="PCA fit — may be slower on dense meshes", icon='INFO')
 
         layout.separator()
+
+        box3 = layout.box()
+        box3.label(text="Mirroring:", icon='MOD_MIRROR')
+        box3.prop(self, "enable_mirror")
+        if self.enable_mirror:
+            box3.prop(self, "mirror_axis")
+            box3.label(text="Splits mesh in half, generates half blocks", icon='INFO')
+
+        layout.separator()
+
+        box4 = layout.box()
+        box4.label(text="Merging:", icon='AUTOMERGE_ON')
+        box4.prop(self, "merge_threshold")
+        box4.label(text="Blocks with this much volume overlap will merge", icon='INFO')
+
+        layout.separator()
         tip = layout.box()
         tip.label(text="💡 Tips:", icon='SETTINGS')
         tip.label(text="• Max blocks: start low (4-16), increase for detail")
         tip.label(text="• Plane threshold 0 = never flatten to plane")
         tip.label(text="• Adjust orientation: best for curved/diagonal surfaces")
+        tip.label(text="• Mirroring: useful for symmetric models to save blocks")
 
 
 # ============================================================================
