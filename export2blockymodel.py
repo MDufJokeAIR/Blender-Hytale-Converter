@@ -812,6 +812,10 @@ def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, e
     # Apply mirroring if enabled
     if enable_mirror:
         blocks = apply_mirroring(blocks, mirror_axis, merge_threshold)
+    
+    # Final merge pass: catch any blocks that became adjacent after previous operations
+    print(f"  Final merge pass...")
+    blocks = merge_adjacent_and_contained_blocks(blocks, merge_threshold)
 
     for i, (center, size, quat) in enumerate(blocks):
         # Relative position
