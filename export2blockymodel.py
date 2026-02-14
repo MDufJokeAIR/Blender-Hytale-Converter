@@ -12,7 +12,7 @@ New approach:
 bl_info = {
     "name": "Export Hytale Blocky Model",
     "author": "Claude",
-    "version": (18, 0, 0),
+    "version": (18, 1, 0),  # With texture export
     "blender": (2, 80, 0),
     "location": "File > Export > Hytale Blocky Model (.blockymodel)",
     "description": "Export meshes to Hytale .blockymodel format",
@@ -25,11 +25,271 @@ import json
 import math
 import time
 import numpy as np
+import os
 
 from bpy.props import StringProperty, BoolProperty, FloatProperty, IntProperty
 from bpy_extras.io_utils import ExportHelper
 from bpy.types import Operator
 from mathutils import Vector, Matrix, Quaternion
+
+# ============================================================================
+# Proportional Texture System
+# ============================================================================
+
+try:
+    from PIL import Image, ImageDraw
+    TEXTURE_AVAILABLE = True
+except ImportError:
+    TEXTURE_AVAILABLE = False
+
+def calculate_blockymodel_bounds(blocks):
+    """Calculate total bounds of all blocks."""
+    if not blocks:
+        return (0, 0, 0, 0, 0, 0)
+    
+    first_center, first_size, _ = blocks[0]
+    min_x = first_center.x - first_size.x / 2
+    max_x = first_center.x + first_size.x / 2
+    min_y = first_center.y - first_size.y / 2
+    max_y = first_center.y + first_size.y / 2
+    min_z = first_center.z - first_size.z / 2
+    max_z = first_center.z + first_size.z / 2
+    
+    for center, size, _ in blocks[1:]:
+        min_x = min(min_x, center.x - size.x / 2)
+        max_x = max(max_x, center.x + size.x / 2)
+        min_y = min(min_y, center.y - size.y / 2)
+        max_y = max(max_y, center.y + size.y / 2)
+        min_z = min(min_z, center.z - size.z / 2)
+        max_z = max(max_z, center.z + size.z / 2)
+    
+    return (min_x, max_x, min_y, max_y, min_z, max_z)
+
+def create_compact_projections(blocks):
+    """
+    Create 6 compact orthographic projections (one per axis).
+    Each projection is a tight 2D view with scale=1 (1 pixel = 1 unit).
+    """
+    if not blocks:
+        return {}, (0,0,0,0,0,0), 10, 10
+    
+    scale = 1  # 1 pixel = 1 unit
+    bounds = calculate_blockymodel_bounds(blocks)
+    min_x, max_x, min_y, max_y, min_z, max_z = bounds
+    
+    # Calculate size of each projection
+    projections = {
+        'nord': {
+            'width': int((max_x - min_x) * scale),
+            'height': int((max_z - min_z) * scale),
+            'offset_x': 0,
+        },
+        'sud': {
+            'width': int((max_x - min_x) * scale),
+            'height': int((max_z - min_z) * scale),
+            'offset_x': 0,
+        },
+        'est': {
+            'width': int((max_y - min_y) * scale),
+            'height': int((max_z - min_z) * scale),
+            'offset_x': 0,
+        },
+        'ouest': {
+            'width': int((max_y - min_y) * scale),
+            'height': int((max_z - min_z) * scale),
+            'offset_x': 0,
+        },
+        'haut': {
+            'width': int((max_x - min_x) * scale),
+            'height': int((max_y - min_y) * scale),
+            'offset_x': 0,
+        },
+        'bas': {
+            'width': int((max_x - min_x) * scale),
+            'height': int((max_y - min_y) * scale),
+            'offset_x': 0,
+        },
+    }
+    
+    # Layout projections horizontally
+    current_x = 0
+    max_height = 0
+    
+    for proj_name in ['nord', 'sud', 'est', 'ouest', 'haut', 'bas']:
+        projections[proj_name]['offset_x'] = current_x
+        current_x += projections[proj_name]['width']
+        max_height = max(max_height, projections[proj_name]['height'])
+    
+    return projections, bounds, current_x, max_height
+
+def calculate_texture_size(blocks):
+    """
+    Calculate texture size using compact projections.
+    Now returns projections instead of sections.
+    """
+    projections, bounds, total_width, max_height = create_compact_projections(blocks)
+    return total_width, max_height, projections, bounds
+
+
+def calculate_all_uvs_compact(blocks):
+    """Calculate UVs with compact projection layout (scale=1)."""
+    if not blocks:
+        return (10, 10, [], {}, (0,0,0,0,0,0))
+    
+    projections, bounds, total_width, max_height = create_compact_projections(blocks)
+    scale = 1
+    min_x, max_x, min_y, max_y, min_z, max_z = bounds
+    
+    all_face_uvs = []
+    
+    for block_center, block_size, _ in blocks:
+        block_uvs = {}
+        
+        faces = {
+            'front': ('nord', block_size.x, block_size.z),
+            'back': ('sud', block_size.x, block_size.z),
+            'right': ('est', block_size.y, block_size.z),
+            'left': ('ouest', block_size.y, block_size.z),
+            'top': ('haut', block_size.x, block_size.y),
+            'bottom': ('bas', block_size.x, block_size.y),
+        }
+        
+        for face_name, (proj_name, face_w, face_h) in faces.items():
+            proj = projections[proj_name]
+            
+            # Calculate position (scale=1)
+            if face_name in ['front', 'back']:
+                local_u = (block_center.x - face_w/2 - min_x) * scale
+                local_v = (block_center.z - face_h/2 - min_z) * scale
+            elif face_name in ['right', 'left']:
+                local_u = (block_center.y - face_w/2 - min_y) * scale
+                local_v = (block_center.z - face_h/2 - min_z) * scale
+            else:
+                local_u = (block_center.x - face_w/2 - min_x) * scale
+                local_v = (block_center.y - face_h/2 - min_y) * scale
+            
+            u = int(proj['offset_x'] + local_u)
+            v = int(local_v)
+            
+            rect_w = int(face_w * scale)
+            rect_h = int(face_h * scale)
+            
+            block_uvs[face_name] = {
+                'projection': proj_name,
+                'u': u,
+                'v': v,
+                'width': rect_w,
+                'height': rect_h,
+                'color': {
+                    'nord': (255, 0, 0, 255),
+                    'sud': (0, 255, 0, 255),
+                    'est': (0, 0, 255, 255),
+                    'ouest': (255, 255, 0, 255),
+                    'haut': (255, 0, 255, 255),
+                    'bas': (0, 255, 255, 255),
+                }[proj_name]
+            }
+        
+        all_face_uvs.append(block_uvs)
+    
+    return total_width, max_height, all_face_uvs, projections, bounds
+
+def create_colored_texture(blocks, output_path):
+    """Create compact texture PNG with scale=1."""
+    if not TEXTURE_AVAILABLE:
+        return None
+    
+    png_width, png_height, all_face_uvs, projections, bounds = calculate_all_uvs_compact(blocks)
+    
+    img = Image.new('RGBA', (png_width, png_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    # Draw projection boundaries
+    for proj_name, proj in projections.items():
+        x = proj['offset_x']
+        w = proj['width']
+        h = proj['height']
+        draw.rectangle([x, 0, x+w, h], outline=(128, 128, 128, 64))
+    
+    # Draw face rectangles
+    total_faces = 0
+    for block_uvs in all_face_uvs:
+        for face_name, face_data in block_uvs.items():
+            u = face_data['u']
+            v = face_data['v']
+            w = face_data['width']
+            h = face_data['height']
+            color = face_data['color']
+            
+            if w > 0 and h > 0:
+                draw.rectangle([u, v, u+w, v+h], fill=color, outline=(255, 255, 255, 192))
+                total_faces += 1
+    
+    png_path = f"{output_path}_texture.png"
+    img.save(png_path)
+    
+    print(f"    Texture: {os.path.basename(png_path)} ({png_width}×{png_height}px)")
+    print(f"    Scale: 1 pixel = 1 unit")
+    print(f"    Drew {total_faces} block faces")
+    
+    return png_path, projections, bounds
+
+
+def export_proportional_texture(blocks, output_path):
+    """Export proportional texture."""
+    if not TEXTURE_AVAILABLE or not blocks:
+        return None, None, None
+    
+    print(f"  Creating proportional texture...")
+    png_path, projections, bounds = create_colored_texture(blocks, output_path)
+    return png_path, projections, bounds
+
+def patch_block_uvs(box_node, block_center, block_size, projections, bounds):
+    """Patch UVs with scale=1 and compact projections."""
+    print(f"    DEBUG: Patching UVs for block at {block_center}")
+    
+    if 'textureLayout' not in box_node['shape']:
+        print("    DEBUG: No textureLayout in box_node!")
+        return box_node
+    
+    scale = 1  # 1 pixel = 1 unit
+    min_x, max_x, min_y, max_y, min_z, max_z = bounds
+    
+    face_to_proj = {
+        'front': ('nord', block_size.x, block_size.z),
+        'back': ('sud', block_size.x, block_size.z),
+        'right': ('est', block_size.y, block_size.z),
+        'left': ('ouest', block_size.y, block_size.z),
+        'top': ('haut', block_size.x, block_size.y),
+        'bottom': ('bas', block_size.x, block_size.y),
+    }
+    
+    for face_name in ['front', 'back', 'left', 'right', 'top', 'bottom']:
+        if face_name in box_node['shape']['textureLayout']:
+            proj_name, face_w, face_h = face_to_proj[face_name]
+            proj = projections[proj_name]
+            
+            # Calculate position (scale=1)
+            if face_name in ['front', 'back']:
+                local_u = (block_center.x - face_w/2 - min_x) * scale
+                local_v = (block_center.z - face_h/2 - min_z) * scale
+            elif face_name in ['right', 'left']:
+                local_u = (block_center.y - face_w/2 - min_y) * scale
+                local_v = (block_center.z - face_h/2 - min_z) * scale
+            else:
+                local_u = (block_center.x - face_w/2 - min_x) * scale
+                local_v = (block_center.y - face_h/2 - min_y) * scale
+            
+            u = int(proj['offset_x'] + local_u)
+            v = int(local_v)
+            
+            print(f"    DEBUG: {face_name} UV = ({u}, {v})")
+            
+            box_node['shape']['textureLayout'][face_name]['offset']['x'] = u
+            box_node['shape']['textureLayout'][face_name]['offset']['y'] = v
+    
+    return box_node
+
 
 
 # ============================================================================
@@ -837,7 +1097,7 @@ def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, e
         )
         group["children"].append(box)
 
-    return group
+    return group, blocks
 
 
 # ============================================================================
@@ -876,19 +1136,19 @@ class ExportBlockyModel(Operator, ExportHelper):
             "Use PCA to rotate each block for a tighter fit to local geometry. "
             "Blocks may overlap but external surface is preserved."
         ),
-        default=False,
+        default=True,
     )
 
     export_selected_only: BoolProperty(
         name="Selected Only",
         description="Export only selected mesh objects",
-        default=False,
+        default=True,
     )
 
     enable_mirror: BoolProperty(
         name="Enable Mirroring",
         description="Split mesh in half and mirror blocks to double coverage",
-        default=False,
+        default=True,
     )
 
     mirror_axis: bpy.props.EnumProperty(
@@ -910,6 +1170,13 @@ class ExportBlockyModel(Operator, ExportHelper):
         max=1.0,
         precision=2,
     )
+
+    export_textures: BoolProperty(
+        name="Export Textures",
+        description="Generate texture atlas (requires Pillow)",
+        default=True,
+    )
+
 
     def execute(self, context):
         t0 = time.time()
@@ -935,9 +1202,10 @@ class ExportBlockyModel(Operator, ExportHelper):
         print("=" * 60)
 
         top_nodes = []
+        all_blocks = []  # Store blocks for each object
         for idx, obj in enumerate(objects):
             print(f"\n[{idx+1}/{len(objects)}] {obj.name}")
-            group = export_mesh(
+            group, blocks = export_mesh(
                 obj,
                 node_id=idx + 1,
                 max_blocks=self.max_blocks,
@@ -948,10 +1216,66 @@ class ExportBlockyModel(Operator, ExportHelper):
                 merge_threshold=self.merge_threshold,
             )
             top_nodes.append(group)
+        all_blocks.append(blocks)  # Store blocks for texture export
 
-        output = {"nodes": top_nodes, "format": "prop", "lod": "auto"}
-
+        # Prepare filepath for JSON and texture
         filepath = bpy.path.abspath(self.filepath)
+        
+        # UV Calculation (always done if export_textures is enabled)
+        if self.export_textures:
+            print("\n" + "="*60)
+            print("UV MAPPING GENERATION")
+            print("="*60)
+            base = os.path.splitext(filepath)[0]
+            
+            for idx, obj in enumerate(objects):
+                try:
+                    blocks = all_blocks[idx]
+                    
+                    # Convert Blender blocks to Hytale coordinates
+                    from mathutils import Vector
+                    hytale_blocks = []
+                    for center, size, quat in blocks:
+                        # Blender (X,Y,Z) → Hytale (X,Z,Y)
+                        h_center = Vector((center.x, center.z, center.y))
+                        h_size = Vector((size.x, size.z, size.y))
+                        hytale_blocks.append((h_center, h_size, quat))
+                    
+                    # Calculate bounds and sections (doesn't need Pillow)
+                    width, height, projections, bounds = calculate_texture_size(hytale_blocks)
+                    
+                    print(f"  Calculated texture layout for {obj.name}: {width}×{height}px")
+                    print(f"  DEBUG: projections = {list(projections.keys())}")
+                    print(f"  DEBUG: bounds = {bounds}")
+                    print(f"  DEBUG: top_nodes[{idx}] has {len(top_nodes[idx].get('children', []))} children")
+                    print(f"  DEBUG: hytale_blocks has {len(hytale_blocks)} blocks")
+                    
+                    # Patch UVs (doesn't need Pillow)
+                    for i, box in enumerate(top_nodes[idx].get("children", [])):
+                        print(f"  DEBUG: Processing box {i}")
+                        if i < len(hytale_blocks):
+                            h_center, h_size, _ = hytale_blocks[i]
+                            patch_block_uvs(box, h_center, h_size, projections, bounds)
+                        else:
+                            print(f"  DEBUG: Skipping box {i} - no matching hytale_block")
+                    
+                    # Create PNG texture (needs Pillow)
+                    if TEXTURE_AVAILABLE:
+                        png_path, projections, bounds = export_proportional_texture(
+                            hytale_blocks, f"{base}_{obj.name}"
+                        )
+                        if png_path:
+                            print(f"  ✓ Texture: {os.path.basename(png_path)}")
+                    else:
+                        print(f"  ⚠ Pillow not installed - UVs created but no texture PNG")
+                    
+                except Exception as e:
+                    print(f"  ✗ {obj.name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        # Write JSON (AFTER patching UVs if textures enabled)
+        output = {"nodes": top_nodes, "format": "prop", "lod": "auto"}
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2)
 
@@ -996,6 +1320,21 @@ class ExportBlockyModel(Operator, ExportHelper):
         box4.prop(self, "merge_threshold")
         box4.label(text="Blocks with this much volume overlap will merge", icon='INFO')
 
+
+        layout.separator()
+        
+        # Textures
+        box = layout.box()
+        box.label(text="Textures:", icon='TEXTURE')
+        box.prop(self, "export_textures")
+        if self.export_textures:
+            if not TEXTURE_AVAILABLE:
+                row = box.row()
+                row.alert = True
+                row.label(text="⚠ Install Pillow", icon='ERROR')
+
+                box.label(text=f"Atlas: {res*4}×{res*3}px", icon='INFO')
+        
         layout.separator()
         tip = layout.box()
         tip.label(text="💡 Tips:", icon='SETTINGS')
