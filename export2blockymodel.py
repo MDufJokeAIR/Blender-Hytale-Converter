@@ -12,7 +12,7 @@ New approach:
 bl_info = {
     "name": "Export Hytale Blocky Model",
     "author": "Claude",
-    "version": (18, 9, 0),  # Face reorientation based on actual direction after rotation
+    "version": (18, 10, 1),  # Fixed projection bounds, better placement order (origin-first)
     "blender": (2, 80, 0),
     "location": "File > Export > Hytale Blocky Model (.blockymodel)",
     "description": "Export meshes to Hytale .blockymodel format",
@@ -280,7 +280,598 @@ def calculate_face_distance_from_origin(block_center, face_normal):
     return distance
 
 
-def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
+def calculate_projection_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
+    """
+    Orthogonal projection-based UV placement:
+    - Each direction gets an orthogonal 2D projection of the mesh
+    - Faces placed at their actual projected 2D positions
+    - Blocks sorted by distance from origin for better placement order
+    - Collision detection ensures no overlap
+    - Maintains spatial relationships between blocks
+    """
+    if not blocks:
+        return (10, 10, [], {})
+    
+    from mathutils import Vector
+    import math
+    
+    min_x, max_x, min_y, max_y, min_z, max_z = calculate_blockymodel_bounds(blocks)
+    scale = 1
+    
+    # Color mapping per face type
+    face_colors = {
+        'front': (255, 100, 100, 255),   # Red
+        'back': (100, 255, 100, 255),    # Green
+        'right': (100, 100, 255, 255),   # Blue
+        'left': (255, 255, 100, 255),    # Yellow
+        'top': (255, 100, 255, 255),     # Magenta
+        'bottom': (100, 255, 255, 255),  # Cyan
+    }
+    
+    # Global direction vectors
+    global_directions = {
+        'front': Vector((0, 0, 1)),
+        'back': Vector((0, 0, -1)),
+        'right': Vector((1, 0, 0)),
+        'left': Vector((-1, 0, 0)),
+        'top': Vector((0, 1, 0)),
+        'bottom': Vector((0, -1, 0)),
+    }
+    
+    local_face_normals = {
+        'front': Vector((0, 0, 1)),
+        'back': Vector((0, 0, -1)),
+        'right': Vector((1, 0, 0)),
+        'left': Vector((-1, 0, 0)),
+        'top': Vector((0, 1, 0)),
+        'bottom': Vector((0, -1, 0)),
+    }
+    
+    def find_closest_global_direction(rotated_normal):
+        best_match = 'front'
+        best_dot = -2
+        for direction, global_vec in global_directions.items():
+            dot = rotated_normal.dot(global_vec)
+            if dot > best_dot:
+                best_dot = dot
+                best_match = direction
+        return best_match
+    
+    # Sort blocks by distance from origin (closest first)
+    # This gives better spatial organization
+    blocks_with_distance = []
+    for idx, (center, size, quat) in enumerate(blocks):
+        distance = math.sqrt(center.x**2 + center.y**2 + center.z**2)
+        blocks_with_distance.append((idx, center, size, quat, distance))
+    
+    blocks_with_distance.sort(key=lambda x: x[4])  # Sort by distance
+    
+    # Collect faces with their 3D positions and directions
+    faces_by_direction = {
+        'front': [], 'back': [], 'left': [], 'right': [], 'top': [], 'bottom': []
+    }
+    
+    num_reoriented = 0
+    
+    for original_idx, block_center, block_size, quat, distance in blocks_with_distance:
+        is_rotated = not (abs(quat.w - 1.0) < 0.001 and 
+                         abs(quat.x) < 0.001 and 
+                         abs(quat.y) < 0.001 and 
+                         abs(quat.z) < 0.001)
+        
+        face_data = {
+            'front': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'back': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'right': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'left': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'top': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
+            'bottom': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
+        }
+        
+        face_direction_mapping = {}
+        
+        if is_rotated:
+            rotation_matrix = quat.to_matrix()
+            for local_face, local_normal in local_face_normals.items():
+                rotated_normal = rotation_matrix @ local_normal
+                global_dir = find_closest_global_direction(rotated_normal)
+                face_direction_mapping[local_face] = global_dir
+                if local_face != global_dir:
+                    num_reoriented += 1
+        else:
+            for face in face_data.keys():
+                face_direction_mapping[face] = face
+        
+        # Add faces with their 3D block center position
+        for local_face, data in face_data.items():
+            target_direction = face_direction_mapping[local_face]
+            
+            faces_by_direction[target_direction].append({
+                'block_idx': original_idx,  # Use original index for JSON
+                'local_face': local_face,
+                'position_3d': block_center.copy(),
+                'size_3d': block_size.copy(),
+                'width': data['width'],
+                'height': data['height'],
+                'color': face_colors[target_direction],
+                'distance': distance  # For sorting
+            })
+    
+    if num_reoriented > 0:
+        print(f"  Reoriented {num_reoriented} faces based on rotation")
+    
+    # Class to track occupied pixels
+    class OccupancyGrid:
+        def __init__(self):
+            self.occupied = set()
+        
+        def is_available(self, x, y, width, height):
+            for py in range(int(y), int(y + height)):
+                for px in range(int(x), int(x + width)):
+                    if (px, py) in self.occupied:
+                        return False
+            return True
+        
+        def mark_occupied(self, x, y, width, height):
+            for py in range(int(y), int(y + height)):
+                for px in range(int(x), int(x + width)):
+                    self.occupied.add((px, py))
+        
+        def get_bounds(self):
+            if not self.occupied:
+                return 0, 0, 0, 0
+            xs = [p[0] for p in self.occupied]
+            ys = [p[1] for p in self.occupied]
+            return min(xs), max(xs), min(ys), max(ys)
+    
+    # Create projections for each direction
+    projections = {}
+    current_y = 0
+    texture_width = 0
+    
+    all_block_uvs = [{} for _ in blocks]
+    
+    for direction in ['top', 'front', 'back', 'left', 'right', 'bottom']:
+        faces = faces_by_direction[direction]
+        if not faces:
+            projections[direction] = {'offset_y': current_y, 'height': 0, 'width': 0}
+            continue
+        
+        # Sort faces by distance from origin (closest first)
+        faces.sort(key=lambda f: f['distance'])
+        
+        print(f"  {direction}: Projecting {len(faces)} faces...")
+        
+        # Calculate 2D projection coordinates
+        face_projections = []
+        
+        for face in faces:
+            pos = face['position_3d']
+            
+            # Project to 2D based on direction
+            if direction in ['top', 'bottom']:
+                proj_x = (pos.x - min_x) * scale
+                proj_y = (pos.z - min_z) * scale
+            elif direction in ['front', 'back']:
+                proj_x = (pos.x - min_x) * scale
+                proj_y = (pos.y - min_y) * scale
+            elif direction in ['left', 'right']:
+                proj_x = (pos.z - min_z) * scale
+                proj_y = (pos.y - min_y) * scale
+            
+            face_projections.append({
+                'face': face,
+                'proj_x': int(proj_x),
+                'proj_y': int(proj_y)
+            })
+        
+        # First pass: place faces and track actual bounds
+        padding = 10
+        occupancy = OccupancyGrid()
+        temp_placements = []  # Store temporary placements
+        placed = 0
+        collisions = 0
+        
+        for fp in face_projections:
+            face = fp['face']
+            target_x = fp['proj_x']
+            target_y = fp['proj_y']
+            w = face['width']
+            h = face['height']
+            
+            # Try to place at projected position (in local projection space)
+            placed_x, placed_y = target_x, target_y
+            
+            if not occupancy.is_available(target_x, target_y, w, h):
+                # Collision! Try offsets: right, left, down, up
+                collisions += 1
+                found = False
+                
+                for offset_dist in range(1, 30):
+                    # Try right
+                    for dx in range(0, offset_dist + 1):
+                        test_x = target_x + dx
+                        test_y = target_y
+                        if occupancy.is_available(test_x, test_y, w, h):
+                            placed_x, placed_y = test_x, test_y
+                            found = True
+                            break
+                    if found:
+                        break
+                    
+                    # Try left
+                    for dx in range(1, offset_dist + 1):
+                        test_x = target_x - dx
+                        test_y = target_y
+                        if occupancy.is_available(test_x, test_y, w, h):
+                            placed_x, placed_y = test_x, test_y
+                            found = True
+                            break
+                    if found:
+                        break
+                    
+                    # Try down
+                    for dy in range(1, offset_dist + 1):
+                        test_x = target_x
+                        test_y = target_y + dy
+                        if occupancy.is_available(test_x, test_y, w, h):
+                            placed_x, placed_y = test_x, test_y
+                            found = True
+                            break
+                    if found:
+                        break
+                    
+                    # Try up
+                    for dy in range(1, offset_dist + 1):
+                        test_x = target_x
+                        test_y = target_y - dy
+                        if occupancy.is_available(test_x, test_y, w, h):
+                            placed_x, placed_y = test_x, test_y
+                            found = True
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    placed_x, placed_y = target_x, target_y
+            
+            # Mark as occupied (in local space)
+            occupancy.mark_occupied(placed_x, placed_y, w, h)
+            
+            # Store temporary placement
+            temp_placements.append({
+                'block_idx': face['block_idx'],
+                'local_face': face['local_face'],
+                'local_x': placed_x,
+                'local_y': placed_y,
+                'width': w,
+                'height': h,
+                'color': face['color']
+            })
+            placed += 1
+        
+        # Calculate actual bounds used in local space
+        min_x_used, max_x_used, min_y_used, max_y_used = occupancy.get_bounds()
+        
+        if min_x_used < max_x_used:
+            # Normalize all placements to start at (padding, padding)
+            offset_x = -min_x_used + padding
+            offset_y = -min_y_used + padding
+            
+            proj_width = (max_x_used - min_x_used) + padding * 2
+            proj_height = (max_y_used - min_y_used) + padding * 2
+        else:
+            offset_x = padding
+            offset_y = padding
+            proj_width = 20
+            proj_height = 20
+        
+        # Second pass: apply normalization and store in global coordinates
+        for placement in temp_placements:
+            block_idx = placement['block_idx']
+            local_face = placement['local_face']
+            
+            # Normalize to projection space with padding
+            final_u = placement['local_x'] + offset_x
+            final_v = placement['local_y'] + offset_y
+            
+            # Add global offset for this projection
+            global_u = final_u
+            global_v = current_y + final_v
+            
+            all_block_uvs[block_idx][local_face] = {
+                'u': global_u,
+                'v': global_v,
+                'width': placement['width'],
+                'height': placement['height'],
+                'color': placement['color'],
+                'mirror': {'x': False, 'y': False}
+            }
+        
+        print(f"    Placed {placed} faces, {collisions} collisions resolved")
+        print(f"    Zone size: {proj_width}×{proj_height}px")
+        
+        projections[direction] = {
+            'offset_y': current_y,
+            'width': proj_width,
+            'height': proj_height
+        }
+        
+        texture_width = max(texture_width, proj_width)
+        current_y += proj_height
+    
+    total_height = current_y
+    
+    print(f"  Projection layout: {texture_width}×{total_height}px")
+    print(f"  Total faces: {sum(len(faces_by_direction[d]) for d in faces_by_direction)}")
+    
+    return texture_width, total_height, all_block_uvs, projections
+    """
+    Orthogonal projection-based UV placement:
+    - Each direction gets an orthogonal 2D projection of the mesh
+    - Faces placed at their actual projected 2D positions
+    - Collision detection ensures no overlap
+    - Maintains spatial relationships between blocks
+    """
+    if not blocks:
+        return (10, 10, [], {})
+    
+    from mathutils import Vector
+    import math
+    
+    min_x, max_x, min_y, max_y, min_z, max_z = calculate_blockymodel_bounds(blocks)
+    scale = 1
+    
+    # Color mapping per face type
+    face_colors = {
+        'front': (255, 100, 100, 255),   # Red
+        'back': (100, 255, 100, 255),    # Green
+        'right': (100, 100, 255, 255),   # Blue
+        'left': (255, 255, 100, 255),    # Yellow
+        'top': (255, 100, 255, 255),     # Magenta
+        'bottom': (100, 255, 255, 255),  # Cyan
+    }
+    
+    # Global direction vectors
+    global_directions = {
+        'front': Vector((0, 0, 1)),
+        'back': Vector((0, 0, -1)),
+        'right': Vector((1, 0, 0)),
+        'left': Vector((-1, 0, 0)),
+        'top': Vector((0, 1, 0)),
+        'bottom': Vector((0, -1, 0)),
+    }
+    
+    local_face_normals = {
+        'front': Vector((0, 0, 1)),
+        'back': Vector((0, 0, -1)),
+        'right': Vector((1, 0, 0)),
+        'left': Vector((-1, 0, 0)),
+        'top': Vector((0, 1, 0)),
+        'bottom': Vector((0, -1, 0)),
+    }
+    
+    def find_closest_global_direction(rotated_normal):
+        best_match = 'front'
+        best_dot = -2
+        for direction, global_vec in global_directions.items():
+            dot = rotated_normal.dot(global_vec)
+            if dot > best_dot:
+                best_dot = dot
+                best_match = direction
+        return best_match
+    
+    # Collect faces with their 3D positions and directions
+    faces_by_direction = {
+        'front': [], 'back': [], 'left': [], 'right': [], 'top': [], 'bottom': []
+    }
+    
+    num_reoriented = 0
+    
+    for block_idx, (block_center, block_size, quat) in enumerate(blocks):
+        is_rotated = not (abs(quat.w - 1.0) < 0.001 and 
+                         abs(quat.x) < 0.001 and 
+                         abs(quat.y) < 0.001 and 
+                         abs(quat.z) < 0.001)
+        
+        face_data = {
+            'front': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'back': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'right': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'left': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'top': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
+            'bottom': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
+        }
+        
+        face_direction_mapping = {}
+        
+        if is_rotated:
+            rotation_matrix = quat.to_matrix()
+            for local_face, local_normal in local_face_normals.items():
+                rotated_normal = rotation_matrix @ local_normal
+                global_dir = find_closest_global_direction(rotated_normal)
+                face_direction_mapping[local_face] = global_dir
+                if local_face != global_dir:
+                    num_reoriented += 1
+        else:
+            for face in face_data.keys():
+                face_direction_mapping[face] = face
+        
+        # Add faces with their 3D block center position
+        for local_face, data in face_data.items():
+            target_direction = face_direction_mapping[local_face]
+            
+            faces_by_direction[target_direction].append({
+                'block_idx': block_idx,
+                'local_face': local_face,
+                'position_3d': block_center.copy(),  # 3D position of block
+                'size_3d': block_size.copy(),
+                'width': data['width'],
+                'height': data['height'],
+                'color': face_colors[target_direction]
+            })
+    
+    if num_reoriented > 0:
+        print(f"  Reoriented {num_reoriented} faces based on rotation")
+    
+    # Class to track occupied pixels
+    class OccupancyGrid:
+        def __init__(self):
+            self.occupied = set()  # Set of (x, y) tuples
+        
+        def is_available(self, x, y, width, height):
+            """Check if rectangle is free."""
+            for py in range(int(y), int(y + height)):
+                for px in range(int(x), int(x + width)):
+                    if (px, py) in self.occupied:
+                        return False
+            return True
+        
+        def mark_occupied(self, x, y, width, height):
+            """Mark rectangle as occupied."""
+            for py in range(int(y), int(y + height)):
+                for px in range(int(x), int(x + width)):
+                    self.occupied.add((px, py))
+    
+    # Create projections for each direction
+    projections = {}
+    current_y = 0
+    texture_width = 0
+    
+    all_block_uvs = [{} for _ in blocks]
+    
+    for direction in ['top', 'front', 'back', 'left', 'right', 'bottom']:
+        faces = faces_by_direction[direction]
+        if not faces:
+            projections[direction] = {'offset_y': current_y, 'height': 0}
+            continue
+        
+        print(f"  {direction}: Projecting {len(faces)} faces...")
+        
+        # Calculate 2D projection coordinates for this direction
+        # Top/Bottom: project onto XZ plane
+        # Front/Back: project onto XY plane  
+        # Left/Right: project onto ZY plane
+        
+        face_projections = []
+        
+        for face in faces:
+            pos = face['position_3d']
+            size = face['size_3d']
+            
+            # Project to 2D based on direction
+            if direction in ['top', 'bottom']:
+                # XZ plane projection
+                proj_x = (pos.x - min_x) * scale
+                proj_y = (pos.z - min_z) * scale
+            elif direction in ['front', 'back']:
+                # XY plane projection
+                proj_x = (pos.x - min_x) * scale
+                proj_y = (pos.y - min_y) * scale
+            elif direction in ['left', 'right']:
+                # ZY plane projection
+                proj_x = (pos.z - min_z) * scale
+                proj_y = (pos.y - min_y) * scale
+            
+            face_projections.append({
+                'face': face,
+                'proj_x': int(proj_x),
+                'proj_y': int(proj_y)
+            })
+        
+        # Calculate projection bounds
+        min_proj_x = min(fp['proj_x'] for fp in face_projections)
+        max_proj_x = max(fp['proj_x'] + fp['face']['width'] for fp in face_projections)
+        min_proj_y = min(fp['proj_y'] for fp in face_projections)
+        max_proj_y = max(fp['proj_y'] + fp['face']['height'] for fp in face_projections)
+        
+        proj_width = max_proj_x - min_proj_x + 4  # +4 for padding
+        proj_height = max_proj_y - min_proj_y + 4
+        
+        # Normalize projections to start at (2, 2) with padding
+        for fp in face_projections:
+            fp['proj_x'] = fp['proj_x'] - min_proj_x + 2
+            fp['proj_y'] = fp['proj_y'] - min_proj_y + 2
+        
+        # Place faces with collision detection
+        occupancy = OccupancyGrid()
+        placed = 0
+        collisions = 0
+        
+        for fp in face_projections:
+            face = fp['face']
+            target_x = fp['proj_x']
+            target_y = current_y + fp['proj_y']
+            w = face['width']
+            h = face['height']
+            
+            # Try to place at projected position
+            placed_x, placed_y = target_x, target_y
+            
+            if not occupancy.is_available(target_x, fp['proj_y'], w, h):
+                # Collision! Try offsets
+                collisions += 1
+                found = False
+                
+                # Try small offsets in a spiral pattern
+                for offset_dist in range(1, 20):
+                    for dx in range(-offset_dist, offset_dist + 1):
+                        for dy in range(-offset_dist, offset_dist + 1):
+                            test_x = target_x + dx
+                            test_y = fp['proj_y'] + dy
+                            
+                            if test_x >= 0 and test_y >= 0:
+                                if occupancy.is_available(test_x, test_y, w, h):
+                                    placed_x = test_x
+                                    placed_y = current_y + test_y
+                                    found = True
+                                    break
+                        if found:
+                            break
+                    if found:
+                        break
+                
+                if not found:
+                    # Couldn't find spot, place anyway and hope for the best
+                    placed_x = target_x
+                    placed_y = target_y
+            
+            # Mark as occupied (in local projection space)
+            occupancy.mark_occupied(placed_x if placed_x >= target_x else target_x, 
+                                   placed_y - current_y if placed_y >= target_y else fp['proj_y'], 
+                                   w, h)
+            
+            # Store UV coordinates
+            block_idx = face['block_idx']
+            local_face = face['local_face']
+            
+            all_block_uvs[block_idx][local_face] = {
+                'u': placed_x,
+                'v': placed_y,
+                'width': w,
+                'height': h,
+                'color': face['color'],
+                'mirror': {'x': False, 'y': False}
+            }
+            placed += 1
+        
+        print(f"    Placed {placed} faces, {collisions} collisions resolved")
+        
+        projections[direction] = {
+            'offset_y': current_y,
+            'width': proj_width,
+            'height': proj_height
+        }
+        
+        texture_width = max(texture_width, proj_width)
+        current_y += proj_height
+    
+    total_height = current_y
+    
+    print(f"  Projection layout: {texture_width}×{total_height}px")
+    print(f"  Total faces: {sum(len(faces_by_direction[d]) for d in faces_by_direction)}")
+    
+    return texture_width, total_height, all_block_uvs, projections
     """
     Simple grid-based UV placement:
     - One grid per face direction (front, back, left, right, top, bottom)
@@ -472,13 +1063,13 @@ def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
 
 def create_orthogonal_projection_texture(blocks, output_path, enable_mirror=False, mirror_axis='X'):
     """
-    Create texture PNG with grid-based layout.
-    Each direction gets its own grid section.
+    Create texture PNG with orthogonal projection layout.
+    Each direction gets a 2D projection that maintains spatial relationships.
     """
     if not TEXTURE_AVAILABLE:
         return None
     
-    texture_width, texture_height, all_block_uvs, grids = calculate_grid_based_uvs(
+    texture_width, texture_height, all_block_uvs, projections = calculate_projection_based_uvs(
         blocks, enable_mirror, mirror_axis
     )
     
@@ -486,35 +1077,18 @@ def create_orthogonal_projection_texture(blocks, output_path, enable_mirror=Fals
     img = Image.new('RGBA', (texture_width, texture_height), (64, 64, 64, 255))
     draw = ImageDraw.Draw(img)
     
-    # Draw grid lines for each direction (for debugging)
-    for direction, grid in grids.items():
-        offset_y = grid['offset_y']
-        cell_w = grid['cell_w']
-        cell_h = grid['cell_h']
-        cols = grid['cols']
-        num_faces = len(grid['faces'])
+    # Draw projection boundaries for each direction (for debugging)
+    for direction, proj in projections.items():
+        offset_y = proj['offset_y']
+        width = proj.get('width', 0)
+        height = proj.get('height', 0)
         
-        if num_faces == 0:
+        if height == 0:
             continue
         
-        rows = (num_faces + cols - 1) // cols
-        
-        # Draw grid boundaries
-        grid_width = cols * cell_w
-        grid_height = rows * cell_h
-        
-        # Outer boundary
-        draw.rectangle([0, offset_y, grid_width-1, offset_y + grid_height-1], 
+        # Draw projection boundary
+        draw.rectangle([0, offset_y, width-1, offset_y + height-1], 
                       outline=(128, 128, 128, 128))
-        
-        # Grid lines (subtle)
-        for row in range(rows + 1):
-            y = offset_y + row * cell_h
-            draw.line([(0, y), (grid_width, y)], fill=(96, 96, 96, 128))
-        
-        for col in range(cols + 1):
-            x = col * cell_w
-            draw.line([(x, offset_y), (x, offset_y + grid_height)], fill=(96, 96, 96, 128))
     
     # Draw all block faces with their colors
     faces_drawn = 0
