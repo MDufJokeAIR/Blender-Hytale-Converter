@@ -12,7 +12,7 @@ New approach:
 bl_info = {
     "name": "Export Hytale Blocky Model",
     "author": "Claude",
-    "version": (18, 1, 0),  # With texture export
+    "version": (18, 8, 1),  # Grid system with 1px padding, mirroring disabled
     "blender": (2, 80, 0),
     "location": "File > Export > Hytale Blocky Model (.blockymodel)",
     "description": "Export meshes to Hytale .blockymodel format",
@@ -131,68 +131,379 @@ def calculate_texture_size(blocks):
     return total_width, max_height, projections, bounds
 
 
-def calculate_all_uvs_compact(blocks):
-    """Calculate UVs with compact projection layout (scale=1)."""
+def calculate_mesh_projections(blocks):
+    """
+    Create 6 orthogonal projections stacked vertically with generous spacing.
+    Each projection gets 2x the mesh size for local overflow handling.
+    
+    Layout (vertical):
+    [top]
+    [front]
+    [back]
+    [left]
+    [right]
+    [bottom]
+    """
     if not blocks:
-        return (10, 10, [], {}, (0,0,0,0,0,0))
+        return (10, 10, [], {}, (0, 0, 0, 0, 0, 0))
     
-    projections, bounds, total_width, max_height = create_compact_projections(blocks)
+    # Calculate bounds of ALL blocks together
+    min_x, max_x, min_y, max_y, min_z, max_z = calculate_blockymodel_bounds(blocks)
+    
+    # Dimensions for each projection (1 pixel = 1 unit)
     scale = 1
-    min_x, max_x, min_y, max_y, min_z, max_z = bounds
     
-    all_face_uvs = []
+    # Base dimensions with padding
+    size_x = int((max_x - min_x) * scale) + 2
+    size_y = int((max_y - min_y) * scale) + 2
+    size_z = int((max_z - min_z) * scale) + 2
     
-    for block_center, block_size, _ in blocks:
-        block_uvs = {}
-        
-        faces = {
-            'front': ('nord', block_size.x, block_size.z),
-            'back': ('sud', block_size.x, block_size.z),
-            'right': ('est', block_size.y, block_size.z),
-            'left': ('ouest', block_size.y, block_size.z),
-            'top': ('haut', block_size.x, block_size.y),
-            'bottom': ('bas', block_size.x, block_size.y),
+    # Multiply by 2 for local overflow space
+    size_x_2x = size_x * 2
+    size_y_2x = size_y * 2
+    size_z_2x = size_z * 2
+    
+    # Vertical stacking
+    current_y = 0
+    
+    projections = {
+        'top': {
+            'width': size_x_2x,
+            'height': size_z_2x,
+            'offset_x': 0,
+            'offset_y': current_y,
+        },
+    }
+    current_y += size_z_2x
+    
+    projections['front'] = {
+        'width': size_x_2x,
+        'height': size_y_2x,
+        'offset_x': 0,
+        'offset_y': current_y,
+    }
+    current_y += size_y_2x
+    
+    projections['back'] = {
+        'width': size_x_2x,
+        'height': size_y_2x,
+        'offset_x': 0,
+        'offset_y': current_y,
+    }
+    current_y += size_y_2x
+    
+    projections['left'] = {
+        'width': size_z_2x,
+        'height': size_y_2x,
+        'offset_x': 0,
+        'offset_y': current_y,
+    }
+    current_y += size_y_2x
+    
+    projections['right'] = {
+        'width': size_z_2x,
+        'height': size_y_2x,
+        'offset_x': 0,
+        'offset_y': current_y,
+    }
+    current_y += size_y_2x
+    
+    projections['bottom'] = {
+        'width': size_x_2x,
+        'height': size_z_2x,
+        'offset_x': 0,
+        'offset_y': current_y,
+    }
+    current_y += size_z_2x
+    
+    # Total texture size
+    total_width = max(size_x_2x, size_z_2x)  # Widest projection
+    total_height = current_y
+    
+    bounds = (min_x, max_x, min_y, max_y, min_z, max_z)
+    
+    print(f"  Mesh bounds: X[{min_x:.1f}, {max_x:.1f}] Y[{min_y:.1f}, {max_y:.1f}] Z[{min_z:.1f}, {max_z:.1f}]")
+    print(f"  Base sizes: X={size_x}, Y={size_y}, Z={size_z}")
+    print(f"  Layout: Vertical stack, {total_width}×{total_height}px (2x space per zone)")
+    
+    return total_width, total_height, projections, bounds, scale
+
+
+def detect_uv_overlap(face1, face2, spacing=1):
+    """Check if two UV rectangles overlap (with small spacing padding)."""
+    u1, v1, w1, h1 = face1
+    u2, v2, w2, h2 = face2
+    
+    # Add minimal spacing padding
+    u1_padded = u1 - spacing
+    v1_padded = v1 - spacing
+    w1_padded = w1 + spacing * 2
+    h1_padded = h1 + spacing * 2
+    
+    u2_padded = u2 - spacing
+    v2_padded = v2 - spacing
+    w2_padded = w2 + spacing * 2
+    h2_padded = h2 + spacing * 2
+    
+    # No overlap if one is completely to the side/above/below the other
+    return not (
+        u1_padded + w1_padded <= u2_padded or  # face1 left of face2
+        u1_padded >= u2_padded + w2_padded or  # face1 right of face2
+        v1_padded + h1_padded <= v2_padded or  # face1 above face2
+        v1_padded >= v2_padded + h2_padded     # face1 below face2
+    )
+
+
+def calculate_face_distance_from_origin(block_center, face_normal):
+    """
+    Calculate distance of a face from origin.
+    Faces further from origin are more visible.
+    """
+    # Distance of block center from origin
+    distance = math.sqrt(block_center.x**2 + block_center.y**2 + block_center.z**2)
+    
+    # Add component in the direction of the face normal
+    # This prioritizes faces pointing away from origin
+    if face_normal == 'front':  # +Z
+        distance += block_center.z
+    elif face_normal == 'back':  # -Z
+        distance -= block_center.z
+    elif face_normal == 'right':  # +X
+        distance += block_center.x
+    elif face_normal == 'left':  # -X
+        distance -= block_center.x
+    elif face_normal == 'top':  # +Y
+        distance += block_center.y
+    elif face_normal == 'bottom':  # -Y
+        distance -= block_center.y
+    
+    return distance
+
+
+def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
+    """
+    Simple grid-based UV placement:
+    - One grid per face direction (front, back, left, right, top, bottom)
+    - Grid cells = size of largest face in that direction + 2px padding
+    - No overlap possible - each face gets its own cell
+    - Faces placed with 1px offset inside cells
+    """
+    if not blocks:
+        return (10, 10, [], {})
+    
+    min_x, max_x, min_y, max_y, min_z, max_z = calculate_blockymodel_bounds(blocks)
+    scale = 1
+    
+    # Color mapping per face type
+    face_colors = {
+        'front': (255, 100, 100, 255),   # Red
+        'back': (100, 255, 100, 255),    # Green
+        'right': (100, 100, 255, 255),   # Blue
+        'left': (255, 255, 100, 255),    # Yellow
+        'top': (255, 100, 255, 255),     # Magenta
+        'bottom': (100, 255, 255, 255),  # Cyan
+    }
+    
+    # MIRRORING DISABLED FOR NOW - just collect all faces
+    # TODO: Re-enable mirroring later once grid placement is stable
+    
+    # Collect all faces by direction
+    faces_by_direction = {
+        'front': [], 'back': [], 'left': [], 'right': [], 'top': [], 'bottom': []
+    }
+    
+    for block_idx, (block_center, block_size, quat) in enumerate(blocks):
+        face_data = {
+            'front': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'back': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
+            'right': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'left': {'width': max(1, int(block_size.z * scale)), 'height': max(1, int(block_size.y * scale))},
+            'top': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
+            'bottom': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
         }
         
-        for face_name, (proj_name, face_w, face_h) in faces.items():
-            proj = projections[proj_name]
+        for face_name, data in face_data.items():
+            faces_by_direction[face_name].append({
+                'block_idx': block_idx,
+                'width': data['width'],
+                'height': data['height'],
+                'color': face_colors[face_name]
+            })
+    
+    # Create grid for each direction
+    grids = {}
+    current_y = 0
+    texture_width = 0
+    
+    for direction in ['top', 'front', 'back', 'left', 'right', 'bottom']:
+        faces = faces_by_direction[direction]
+        if not faces:
+            grids[direction] = {'cell_w': 1, 'cell_h': 1, 'cols': 1, 'offset_y': current_y, 'faces': []}
+            continue
+        
+        # Max dimensions for grid cells (+ 2px padding for 1px border on each side)
+        max_w = max(f['width'] for f in faces) + 2
+        max_h = max(f['height'] for f in faces) + 2
+        
+        # Grid layout (squarish)
+        cols = max(1, int(math.sqrt(len(faces))))
+        rows = (len(faces) + cols - 1) // cols
+        
+        grid_width = cols * max_w
+        grid_height = rows * max_h
+        
+        grids[direction] = {
+            'cell_w': max_w,
+            'cell_h': max_h,
+            'cols': cols,
+            'offset_y': current_y,
+            'faces': faces
+        }
+        
+        texture_width = max(texture_width, grid_width)
+        current_y += grid_height
+        
+        print(f"  {direction}: {len(faces)} faces in {cols}×{rows} grid (cell {max_w}×{max_h})")
+    
+    total_height = current_y
+    
+    # Place faces in grids WITH 1px OFFSET INSIDE CELLS
+    all_block_uvs = [{} for _ in blocks]
+    
+    for direction, grid in grids.items():
+        for idx, face_data in enumerate(grid['faces']):
+            row = idx // grid['cols']
+            col = idx % grid['cols']
             
-            # Calculate position (scale=1)
-            if face_name in ['front', 'back']:
-                local_u = (block_center.x - face_w/2 - min_x) * scale
-                local_v = (block_center.z - face_h/2 - min_z) * scale
-            elif face_name in ['right', 'left']:
-                local_u = (block_center.y - face_w/2 - min_y) * scale
-                local_v = (block_center.z - face_h/2 - min_z) * scale
-            else:
-                local_u = (block_center.x - face_w/2 - min_x) * scale
-                local_v = (block_center.y - face_h/2 - min_y) * scale
+            # Base position of cell
+            cell_u = col * grid['cell_w']
+            cell_v = grid['offset_y'] + row * grid['cell_h']
             
-            u = int(proj['offset_x'] + local_u)
-            v = int(local_v)
+            # Place face with 1px offset inside cell
+            u = cell_u + 1
+            v = cell_v + 1
             
-            rect_w = int(face_w * scale)
-            rect_h = int(face_h * scale)
-            
-            block_uvs[face_name] = {
-                'projection': proj_name,
+            block_idx = face_data['block_idx']
+            all_block_uvs[block_idx][direction] = {
                 'u': u,
                 'v': v,
-                'width': rect_w,
-                'height': rect_h,
-                'color': {
-                    'nord': (255, 0, 0, 255),
-                    'sud': (0, 255, 0, 255),
-                    'est': (0, 0, 255, 255),
-                    'ouest': (255, 255, 0, 255),
-                    'haut': (255, 0, 255, 255),
-                    'bas': (0, 255, 255, 255),
-                }[proj_name]
+                'width': face_data['width'],
+                'height': face_data['height'],
+                'color': face_data['color'],
+                'mirror': {'x': False, 'y': False}
             }
-        
-        all_face_uvs.append(block_uvs)
     
-    return total_width, max_height, all_face_uvs, projections, bounds
+    print(f"  Grid layout: {texture_width}×{total_height}px")
+    print(f"  Total faces: {sum(len(g['faces']) for g in grids.values())}")
+    
+    return texture_width, total_height, all_block_uvs, grids
+
+
+def create_orthogonal_projection_texture(blocks, output_path, enable_mirror=False, mirror_axis='X'):
+    """
+    Create texture PNG with grid-based layout.
+    Each direction gets its own grid section.
+    """
+    if not TEXTURE_AVAILABLE:
+        return None
+    
+    texture_width, texture_height, all_block_uvs, grids = calculate_grid_based_uvs(
+        blocks, enable_mirror, mirror_axis
+    )
+    
+    # Create image with dark gray background
+    img = Image.new('RGBA', (texture_width, texture_height), (64, 64, 64, 255))
+    draw = ImageDraw.Draw(img)
+    
+    # Draw grid lines for each direction (for debugging)
+    for direction, grid in grids.items():
+        offset_y = grid['offset_y']
+        cell_w = grid['cell_w']
+        cell_h = grid['cell_h']
+        cols = grid['cols']
+        num_faces = len(grid['faces'])
+        
+        if num_faces == 0:
+            continue
+        
+        rows = (num_faces + cols - 1) // cols
+        
+        # Draw grid boundaries
+        grid_width = cols * cell_w
+        grid_height = rows * cell_h
+        
+        # Outer boundary
+        draw.rectangle([0, offset_y, grid_width-1, offset_y + grid_height-1], 
+                      outline=(128, 128, 128, 128))
+        
+        # Grid lines (subtle)
+        for row in range(rows + 1):
+            y = offset_y + row * cell_h
+            draw.line([(0, y), (grid_width, y)], fill=(96, 96, 96, 128))
+        
+        for col in range(cols + 1):
+            x = col * cell_w
+            draw.line([(x, offset_y), (x, offset_y + grid_height)], fill=(96, 96, 96, 128))
+    
+    # Draw all block faces with their colors
+    faces_drawn = 0
+    faces_skipped = 0
+    
+    for block_idx, block_uvs in enumerate(all_block_uvs):
+        for face_name, face_data in block_uvs.items():
+            u = face_data['u']
+            v = face_data['v']
+            w = face_data['width']
+            h = face_data['height']
+            color = face_data['color']
+            
+            # Validate dimensions
+            if w <= 0 or h <= 0:
+                faces_skipped += 1
+                continue
+            
+            # Draw the face
+            try:
+                draw.rectangle([u, v, u+w-1, v+h-1], fill=color)
+                faces_drawn += 1
+            except Exception as e:
+                print(f"      ERROR drawing block {block_idx} {face_name}: {e}")
+                faces_skipped += 1
+    
+    print(f"    Drew {faces_drawn} faces" + (f", skipped {faces_skipped}" if faces_skipped > 0 else ""))
+    
+    png_path = f"{output_path}_texture.png"
+    img.save(png_path)
+    
+    print(f"    Texture: {os.path.basename(png_path)} ({texture_width}×{texture_height}px)")
+    
+    return png_path, texture_width, texture_height, all_block_uvs
+
+
+def patch_block_uvs_from_projections(box_node, block_idx, all_block_uvs):
+    """Patch UVs with orthogonal projection or overflow coordinates, including mirror flags."""
+    if block_idx >= len(all_block_uvs):
+        print(f"    WARNING: block_idx {block_idx} out of range")
+        return box_node
+    
+    if 'textureLayout' not in box_node['shape']:
+        print("    DEBUG: No textureLayout in box_node!")
+        return box_node
+    
+    block_uvs = all_block_uvs[block_idx]
+    
+    for face_name in ['front', 'back', 'left', 'right', 'top', 'bottom']:
+        if face_name in box_node['shape']['textureLayout'] and face_name in block_uvs:
+            uv_data = block_uvs[face_name]
+            box_node['shape']['textureLayout'][face_name]['offset']['x'] = uv_data['u']
+            box_node['shape']['textureLayout'][face_name]['offset']['y'] = uv_data['v']
+            
+            # Apply mirror flags if present
+            if 'mirror' in uv_data:
+                box_node['shape']['textureLayout'][face_name]['mirror']['x'] = uv_data['mirror']['x']
+                box_node['shape']['textureLayout'][face_name]['mirror']['y'] = uv_data['mirror']['y']
+    
+    return box_node
 
 def create_colored_texture(blocks, output_path):
     """Create compact texture PNG with scale=1."""
@@ -429,6 +740,56 @@ def sample_face_points(vertices, faces):
                         samples.append(v0 * (1 - u - v) + v1 * u + v2 * v)
 
     return samples
+
+
+# ============================================================================
+# Integer rounding for blocks
+# ============================================================================
+
+def round_blocks_to_integer(blocks, scale_multiplier=1):
+    """
+    Round block sizes and positions to create integer dimensions.
+    
+    Args:
+        blocks: list of (center, size, quaternion) tuples
+        scale_multiplier: multiply all dimensions by this factor first
+    
+    Returns:
+        list of (center, size, quaternion) with integer sizes
+    """
+    rounded_blocks = []
+    
+    for center, size, quat in blocks:
+        # Apply scale multiplier
+        scaled_size = Vector((
+            size.x * scale_multiplier,
+            size.y * scale_multiplier,
+            size.z * scale_multiplier,
+        ))
+        scaled_center = Vector((
+            center.x * scale_multiplier,
+            center.y * scale_multiplier,
+            center.z * scale_multiplier,
+        ))
+        
+        # Round sizes to nearest integer (minimum 1 for non-zero dimensions)
+        new_size = Vector((
+            max(1, round(scaled_size.x)) if scaled_size.x > 0.1 else 0.0,
+            max(1, round(scaled_size.y)) if scaled_size.y > 0.1 else 0.0,
+            max(1, round(scaled_size.z)) if scaled_size.z > 0.1 else 0.0,
+        ))
+        
+        # Adjust center to align with integer grid
+        # Round center to nearest 0.5 to keep blocks aligned
+        new_center = Vector((
+            round(scaled_center.x * 2) / 2,
+            round(scaled_center.y * 2) / 2,
+            round(scaled_center.z * 2) / 2,
+        ))
+        
+        rounded_blocks.append((new_center, new_size, quat))
+    
+    return rounded_blocks
 
 
 # ============================================================================
@@ -1057,7 +1418,7 @@ def merge_adjacent_and_contained_blocks(blocks, volume_overlap_threshold=0.95):
     return merged_blocks
 
 
-def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, enable_mirror=False, mirror_axis='X', merge_threshold=0.95):
+def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, enable_mirror=False, mirror_axis='X', merge_threshold=0.95, scale_multiplier=1, integer_only=False):
     """Build group node + child box nodes for one mesh object."""
     world_pos = obj.matrix_world.translation
 
@@ -1076,6 +1437,14 @@ def export_mesh(obj, node_id, max_blocks, adjust_orientation, plane_threshold, e
     # Final merge pass: catch any blocks that became adjacent after previous operations
     print(f"  Final merge pass...")
     blocks = merge_adjacent_and_contained_blocks(blocks, merge_threshold)
+    
+    # Apply integer rounding if requested
+    if integer_only or scale_multiplier > 1:
+        print(f"  Applying scale multiplier: {scale_multiplier}x")
+        if integer_only:
+            print(f"  Rounding to integer sizes...")
+        blocks = round_blocks_to_integer(blocks, scale_multiplier)
+        print(f"  After rounding: {len(blocks)} blocks")
 
     for i, (center, size, quat) in enumerate(blocks):
         # Relative position
@@ -1176,6 +1545,20 @@ class ExportBlockyModel(Operator, ExportHelper):
         description="Generate texture atlas (requires Pillow)",
         default=True,
     )
+    
+    scale_multiplier: IntProperty(
+        name="Scale Multiplier",
+        description="Multiply mesh dimensions by this factor (1-10). Higher values = larger integer sizes",
+        default=1,
+        min=1,
+        max=10,
+    )
+    
+    integer_only: BoolProperty(
+        name="Integer Sizes Only",
+        description="Force block sizes to be whole numbers (better for textures)",
+        default=True,
+    )
 
 
     def execute(self, context):
@@ -1191,14 +1574,18 @@ class ExportBlockyModel(Operator, ExportHelper):
             return {'CANCELLED'}
 
         print("\n" + "=" * 60)
-        print("HYTALE BLOCKY MODEL EXPORT v18")
+        print("HYTALE BLOCKY MODEL EXPORT v18.8")
         print(f"  Objects       : {len(objects)}")
         print(f"  Max blocks    : {self.max_blocks}")
         print(f"  Plane thresh  : {self.plane_threshold}")
         print(f"  Adjust orient : {self.adjust_orientation}")
         print(f"  Merge thresh  : {self.merge_threshold * 100:.0f}%")
+        if self.scale_multiplier > 1 or self.integer_only:
+            print(f"  Scale mult.   : {self.scale_multiplier}x")
+            print(f"  Integer only  : {self.integer_only}")
         if self.enable_mirror:
             print(f"  Mirror axis   : {self.mirror_axis}")
+            print(f"  Mirror UVs    : Grid-based (parallel faces)")
         print("=" * 60)
 
         top_nodes = []
@@ -1214,6 +1601,8 @@ class ExportBlockyModel(Operator, ExportHelper):
                 enable_mirror=self.enable_mirror,
                 mirror_axis=self.mirror_axis,
                 merge_threshold=self.merge_threshold,
+                scale_multiplier=self.scale_multiplier,
+                integer_only=self.integer_only,
             )
             top_nodes.append(group)
         all_blocks.append(blocks)  # Store blocks for texture export
@@ -1224,7 +1613,7 @@ class ExportBlockyModel(Operator, ExportHelper):
         # UV Calculation (always done if export_textures is enabled)
         if self.export_textures:
             print("\n" + "="*60)
-            print("UV MAPPING GENERATION")
+            print("UV MAPPING GENERATION (PRIORITY-BASED + OVERFLOW)")
             print("="*60)
             base = os.path.splitext(filepath)[0]
             
@@ -1241,33 +1630,25 @@ class ExportBlockyModel(Operator, ExportHelper):
                         h_size = Vector((size.x, size.z, size.y))
                         hytale_blocks.append((h_center, h_size, quat))
                     
-                    # Calculate bounds and sections (doesn't need Pillow)
-                    width, height, projections, bounds = calculate_texture_size(hytale_blocks)
+                    print(f"  Processing {obj.name}: {len(hytale_blocks)} blocks")
                     
-                    print(f"  Calculated texture layout for {obj.name}: {width}×{height}px")
-                    print(f"  DEBUG: projections = {list(projections.keys())}")
-                    print(f"  DEBUG: bounds = {bounds}")
-                    print(f"  DEBUG: top_nodes[{idx}] has {len(top_nodes[idx].get('children', []))} children")
-                    print(f"  DEBUG: hytale_blocks has {len(hytale_blocks)} blocks")
-                    
-                    # Patch UVs (doesn't need Pillow)
-                    for i, box in enumerate(top_nodes[idx].get("children", [])):
-                        print(f"  DEBUG: Processing box {i}")
-                        if i < len(hytale_blocks):
-                            h_center, h_size, _ = hytale_blocks[i]
-                            patch_block_uvs(box, h_center, h_size, projections, bounds)
-                        else:
-                            print(f"  DEBUG: Skipping box {i} - no matching hytale_block")
-                    
-                    # Create PNG texture (needs Pillow)
+                    # Create PNG texture with priority-based placement (needs Pillow)
                     if TEXTURE_AVAILABLE:
-                        png_path, projections, bounds = export_proportional_texture(
-                            hytale_blocks, f"{base}_{obj.name}"
+                        result = create_orthogonal_projection_texture(
+                            hytale_blocks, f"{base}_{obj.name}",
+                            enable_mirror=self.enable_mirror,
+                            mirror_axis=self.mirror_axis
                         )
-                        if png_path:
+                        if result:
+                            png_path, texture_width, texture_height, all_block_uvs = result
                             print(f"  ✓ Texture: {os.path.basename(png_path)}")
+                            
+                            # Patch UVs in the JSON nodes
+                            for i, box in enumerate(top_nodes[idx].get("children", [])):
+                                if i < len(all_block_uvs):
+                                    patch_block_uvs_from_projections(box, i, all_block_uvs)
                     else:
-                        print(f"  ⚠ Pillow not installed - UVs created but no texture PNG")
+                        print(f"  ⚠ Pillow not installed - no texture PNG created")
                     
                 except Exception as e:
                     print(f"  ✗ {obj.name}: {e}")
@@ -1323,6 +1704,18 @@ class ExportBlockyModel(Operator, ExportHelper):
 
         layout.separator()
         
+        # Size Options
+        box_size = layout.box()
+        box_size.label(text="Size & Scale:", icon='EMPTY_ARROWS')
+        box_size.prop(self, "scale_multiplier")
+        box_size.prop(self, "integer_only")
+        if self.integer_only:
+            box_size.label(text="Rounds sizes to whole numbers (better for textures)", icon='INFO')
+        if self.scale_multiplier > 1:
+            box_size.label(text=f"All dimensions multiplied by {self.scale_multiplier}x", icon='INFO')
+        
+        layout.separator()
+        
         # Textures
         box = layout.box()
         box.label(text="Textures:", icon='TEXTURE')
@@ -1332,14 +1725,16 @@ class ExportBlockyModel(Operator, ExportHelper):
                 row = box.row()
                 row.alert = True
                 row.label(text="⚠ Install Pillow", icon='ERROR')
-
-                box.label(text=f"Atlas: {res*4}×{res*3}px", icon='INFO')
+            else:
+                box.label(text="6 orthogonal projections of entire mesh", icon='INFO')
         
         layout.separator()
         tip = layout.box()
         tip.label(text="💡 Tips:", icon='SETTINGS')
         tip.label(text="• Max blocks: start low (4-16), increase for detail")
         tip.label(text="• Plane threshold 0 = never flatten to plane")
+        tip.label(text="• Scale multiplier: use 2-5x for larger textures")
+        tip.label(text="• Integer only: prevents texture misalignment issues")
         tip.label(text="• Adjust orientation: best for curved/diagonal surfaces")
         tip.label(text="• Mirroring: useful for symmetric models to save blocks")
 
