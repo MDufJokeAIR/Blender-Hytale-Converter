@@ -12,7 +12,7 @@ New approach:
 bl_info = {
     "name": "Export Hytale Blocky Model",
     "author": "Claude",
-    "version": (18, 8, 1),  # Grid system with 1px padding, mirroring disabled
+    "version": (18, 9, 0),  # Face reorientation based on actual direction after rotation
     "blender": (2, 80, 0),
     "location": "File > Export > Hytale Blocky Model (.blockymodel)",
     "description": "Export meshes to Hytale .blockymodel format",
@@ -287,6 +287,7 @@ def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
     - Grid cells = size of largest face in that direction + 2px padding
     - No overlap possible - each face gets its own cell
     - Faces placed with 1px offset inside cells
+    - For rotated blocks: faces assigned to grids based on actual world direction
     """
     if not blocks:
         return (10, 10, [], {})
@@ -304,15 +305,55 @@ def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
         'bottom': (100, 255, 255, 255),  # Cyan
     }
     
-    # MIRRORING DISABLED FOR NOW - just collect all faces
-    # TODO: Re-enable mirroring later once grid placement is stable
+    # Global direction vectors
+    global_directions = {
+        'front': Vector((0, 0, 1)),   # +Z
+        'back': Vector((0, 0, -1)),   # -Z
+        'right': Vector((1, 0, 0)),   # +X
+        'left': Vector((-1, 0, 0)),   # -X
+        'top': Vector((0, 1, 0)),     # +Y
+        'bottom': Vector((0, -1, 0)), # -Y
+    }
     
-    # Collect all faces by direction
+    # Local face normals (before rotation)
+    local_face_normals = {
+        'front': Vector((0, 0, 1)),
+        'back': Vector((0, 0, -1)),
+        'right': Vector((1, 0, 0)),
+        'left': Vector((-1, 0, 0)),
+        'top': Vector((0, 1, 0)),
+        'bottom': Vector((0, -1, 0)),
+    }
+    
+    def find_closest_global_direction(rotated_normal):
+        """Find which global direction is closest to the rotated normal."""
+        best_match = 'front'
+        best_dot = -2
+        
+        for direction, global_vec in global_directions.items():
+            dot = rotated_normal.dot(global_vec)
+            if dot > best_dot:
+                best_dot = dot
+                best_match = direction
+        
+        return best_match
+    
+    # MIRRORING DISABLED FOR NOW - just collect all faces
+    
+    # Collect all faces by direction (considering rotation)
     faces_by_direction = {
         'front': [], 'back': [], 'left': [], 'right': [], 'top': [], 'bottom': []
     }
     
+    num_reoriented = 0
+    
     for block_idx, (block_center, block_size, quat) in enumerate(blocks):
+        # Check if block is rotated (quaternion not identity)
+        is_rotated = not (abs(quat.w - 1.0) < 0.001 and 
+                         abs(quat.x) < 0.001 and 
+                         abs(quat.y) < 0.001 and 
+                         abs(quat.z) < 0.001)
+        
         face_data = {
             'front': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
             'back': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.y * scale))},
@@ -322,13 +363,41 @@ def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
             'bottom': {'width': max(1, int(block_size.x * scale)), 'height': max(1, int(block_size.z * scale))},
         }
         
-        for face_name, data in face_data.items():
-            faces_by_direction[face_name].append({
+        # Map local face names to actual global directions
+        face_direction_mapping = {}
+        
+        if is_rotated:
+            # Rotate each local face normal to find its actual global direction
+            rotation_matrix = quat.to_matrix()
+            
+            for local_face, local_normal in local_face_normals.items():
+                # Apply rotation to local normal
+                rotated_normal = rotation_matrix @ local_normal
+                # Find closest global direction
+                global_dir = find_closest_global_direction(rotated_normal)
+                face_direction_mapping[local_face] = global_dir
+                
+                if local_face != global_dir:
+                    num_reoriented += 1
+        else:
+            # No rotation: local face = global direction
+            for face in face_data.keys():
+                face_direction_mapping[face] = face
+        
+        # Add faces to the appropriate direction grids
+        for local_face, data in face_data.items():
+            target_direction = face_direction_mapping[local_face]
+            
+            faces_by_direction[target_direction].append({
                 'block_idx': block_idx,
+                'local_face': local_face,  # Which face slot in the block JSON
                 'width': data['width'],
                 'height': data['height'],
-                'color': face_colors[face_name]
+                'color': face_colors[target_direction]  # Use target direction color
             })
+    
+    if num_reoriented > 0:
+        print(f"  Reoriented {num_reoriented} faces based on rotation")
     
     # Create grid for each direction
     grids = {}
@@ -384,7 +453,9 @@ def calculate_grid_based_uvs(blocks, enable_mirror=False, mirror_axis='X'):
             v = cell_v + 1
             
             block_idx = face_data['block_idx']
-            all_block_uvs[block_idx][direction] = {
+            local_face = face_data['local_face']  # Use local face name for JSON
+            
+            all_block_uvs[block_idx][local_face] = {
                 'u': u,
                 'v': v,
                 'width': face_data['width'],
